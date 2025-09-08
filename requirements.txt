@@ -1,2 +1,7 @@
 streamlit==1.*
 pandas==2.*
+
+streamlit>=1.33.0
+pandas>=2.1.0
+gspread>=6.1.2
+google-auth>=2.29.0
