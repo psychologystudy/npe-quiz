@@ -3,7 +3,6 @@ import streamlit as st
 import pandas as pd
 import random
 from datetime import datetime
-import matplotlib.pyplot as plt
 
 # ----------------------------
 # Config & constants
@@ -206,7 +205,7 @@ def quiz_screen(item, idx, total):
         if expl:
             st.info(f"**Explanation:** {expl}")
 
-        # Store result
+        # Store result (include explanation so we can show it in the final review)
         correct_text = next((d["text"] for d in disp if d["disp_lab"] == correct_disp), "")
         chosen_text = next((d["text"] for d in disp if d["disp_lab"] == chosen_lab), "")
 
@@ -219,6 +218,7 @@ def quiz_screen(item, idx, total):
                 "chosen_text": chosen_text,
                 "correct_label": correct_disp or r.get("Correct_Answer", ""),
                 "correct_text": correct_text,
+                "explanation": expl,
                 "is_correct": int(is_correct),
             }
         )
@@ -247,43 +247,33 @@ def results_screen():
             st.caption(f"Domain: {row['domain'] or '—'}")
 
             # Answers block
-            chosen = f"{row['chosen_label']}. {row['chosen_text']}".strip()
+            chosen = f"{row['chosen_label']}. {row['chosen_text']}".strip() if row['chosen_label'] else "—"
             correct = f"{row['correct_label']}. {row['correct_text']}".strip()
 
             if row["is_correct"]:
                 st.markdown(f"**✅ Your answer:** {chosen}")
             else:
-                st.markdown(f"**❌ Your answer:** {chosen if row['chosen_label'] else '—'}")
+                st.markdown(f"**❌ Your answer:** {chosen}")
                 st.markdown(f"**✅ Correct answer:** {correct}")
 
-            # Explanation (if available)
-            if row["correct_text"]:
-                # Explanation already printed during quiz; show again only if present.
-                # We don't have separate field here, but we can re-display from item store if needed.
-                pass
+            # Explanation
+            if str(row.get("explanation", "")).strip():
+                st.markdown(f"**Explanation:** {row['explanation']}")
 
-        # Add a little space before analytics
         st.markdown("")
 
-        # Domain performance bar chart (placed at the end, as requested)
+        # Domain performance bar chart (no matplotlib; use Streamlit's built-in)
         st.markdown("### Performance by domain")
         acc = (
             res_df.groupby("domain")["is_correct"]
             .mean()
             .fillna(0.0)
             .mul(100)
-            .sort_values(ascending=False)
             .round(1)
         )
         if not acc.empty:
-            fig, ax = plt.subplots()
-            ax.bar(acc.index.astype(str), acc.values)  # no color/style set (Streamlit guideline)
-            ax.set_ylim(0, 100)
-            ax.set_ylabel("Accuracy (%)")
-            ax.set_title("Accuracy by Domain")
-            for x, y in enumerate(acc.values):
-                ax.text(x, y + 1, f"{y:.1f}%", ha="center", va="bottom", fontsize=9)
-            st.pyplot(fig, use_container_width=True)
+            chart_df = acc.rename("Accuracy %").to_frame()
+            st.bar_chart(chart_df, use_container_width=True)
 
             # Simple recommendation (focus area)
             worst_domain = acc.idxmin()
