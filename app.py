@@ -148,7 +148,6 @@ This little app started as **my personal study tool** for the National Psycholog
 **How it works**
 - Questions are drawn from a local bank.
 - Choose a **Domain** and **Number of questions** in the sidebar.
-- You’ll get immediate feedback and explanations as you go.
 - At the end, you’ll see a **scrollable list of every question**, your answer, the **correct answer**, and an explanation.
 - You’ll also get a **bar chart** showing how you went by domain to help guide future revision.
 
