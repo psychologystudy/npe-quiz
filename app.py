@@ -3,7 +3,6 @@ import streamlit as st
 import pandas as pd
 import random
 from datetime import datetime
-from io import StringIO
 import hashlib
 import uuid
 
@@ -18,25 +17,26 @@ except Exception:  # pragma: no cover
 # ---------- Config ----------
 st.set_page_config(page_title="NPE Quiz", page_icon="🧠", layout="centered")
 
-BANK_VERSION = "NPE Bank v1.0 • 2025-09-08"
+BANK_VERSION = "NPE Bank v1.2 • 2025-09-11"
 BUNDLED_CSV = "data/questions.csv"
 
+# REQUIRED columns: Source is now optional/ignored in UI
 REQUIRED_COLS = [
     "Question", "Option_A", "Option_B", "Option_C", "Option_D", "Option_E",
-    "Correct_Answer", "Explanation", "Domain", "Source"
+    "Correct_Answer", "Explanation", "Domain"
 ]
 
 # Fixed domains shown to user (case-insensitive match with CSV)
 DOMAIN_OPTIONS = ["All", "Ethics", "Assessment", "Interventions", "Communication"]
+CANON_DOMAINS = {d.lower(): d for d in DOMAIN_OPTIONS if d != "All"}
 
-# Seed a short session id for flag logging
+# Session id for flag logging
 if "session_id" not in st.session_state:
     st.session_state.session_id = uuid.uuid4().hex[:8]
 
 # ---------- Data loading & validation ----------
 @st.cache_data
 def load_questions(path: str) -> pd.DataFrame:
-    # Try utf-8-sig first; fallback to utf-8; finally let pandas guess
     try:
         return pd.read_csv(path, encoding="utf-8-sig")
     except Exception:
@@ -45,13 +45,31 @@ def load_questions(path: str) -> pd.DataFrame:
         except Exception:
             return pd.read_csv(path)
 
+def _canon_domain(val: str) -> str:
+    """Map arbitrary domain text to our canonical set; return '' if no match."""
+    v = (val or "").strip().lower()
+    if not v:
+        return ""
+    # simple synonyms / fuzzy-ish mapping
+    if v.startswith("ethic"):
+        return "Ethics"
+    if v.startswith("assess"):
+        return "Assessment"
+    if v.startswith("interven") or v.startswith("treat") or v.startswith("therapy"):
+        return "Interventions"
+    if v.startswith("comm"):
+        return "Communication"
+    # if exact match already canonical
+    return CANON_DOMAINS.get(v, "")
+
 def clean_and_validate(df: pd.DataFrame):
     """
     - Ensure required columns exist
     - Strip whitespace
     - Replace literal 'nan' strings with ''
     - Validate A–E answer points to a non-empty option
-    Returns: (df_ok, issues)
+    - Canonicalise Domain to one of {Ethics, Assessment, Interventions, Communication} when possible
+    Returns: (df_ok, issues, missing_report_df)
     """
     issues = []
 
@@ -60,11 +78,14 @@ def clean_and_validate(df: pd.DataFrame):
         if c not in df.columns:
             df[c] = ""
 
-    # Trim whitespace & normalise 'nan' strings
+    # Trim whitespace & normalise 'nan'
     for c in df.columns:
         if df[c].dtype == object:
             df[c] = df[c].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
             df[c] = df[c].replace({"nan": ""})
+
+    # Canonicalise Domain (if possible)
+    df["Domain"] = df["Domain"].apply(_canon_domain)
 
     ok_rows = []
     seen_stems = set()
@@ -96,14 +117,21 @@ def clean_and_validate(df: pd.DataFrame):
         ok_rows.append(i)
 
     df_ok = df.loc[ok_rows].reset_index(drop=True)
-    return df_ok, issues
+
+    # Build a small report of missing fields you want to complete
+    miss_mask = (df_ok["Explanation"].eq("")) | (df_ok["Domain"].eq(""))
+    missing_report = df_ok.loc[miss_mask, ["Question", "Option_A", "Option_B", "Option_C",
+                                           "Option_D", "Option_E", "Correct_Answer",
+                                           "Explanation", "Domain"]].copy()
+
+    return df_ok, issues, missing_report
 
 # ---------- Google Sheets helpers ----------
 @st.cache_resource
 def get_flags_worksheet():
     """
     Return a gspread Worksheet for the 'flags' tab, or None if not configured.
-    Requires Streamlit secrets:
+    Secrets required:
       GSPREAD_SHEET_ID = "<sheet_id>"
       [gcp_service_account]  # full service account JSON fields
     """
@@ -126,24 +154,33 @@ def get_flags_worksheet():
         ws = sh.worksheet("flags")
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title="flags", rows=2000, cols=10)
-        ws.append_row(["ts", "session_id", "domain", "source", "question_hash", "question"])
+        ws.append_row(["ts", "session_id", "domain", "question_hash", "question"])
     return ws
 
-def append_flag_to_sheet(domain: str, question: str, source: str):
+def append_flag_to_sheet(domain: str, question: str):
     """Append one flag row; returns (ok: bool, message: str)."""
     ws = get_flags_worksheet()
     if ws is None:
         return False, "Google Sheets not configured."
-    qhash = hashlib.sha1((question or "").encode("utf-8")).hexdigest()[:10]
-    ws.append_row([
-        datetime.now().isoformat(timespec="seconds"),
-        st.session_state.get("session_id", ""),
-        domain or "",
-        source or "",
-        qhash,
-        question or "",
-    ])
-    return True, "Saved to Google Sheet."
+    try:
+        qhash = hashlib.sha1((question or "").encode("utf-8")).hexdigest()[:10]
+        ws.append_row([
+            datetime.now().isoformat(timespec="seconds"),
+            st.session_state.get("session_id", ""),
+            domain or "",
+            qhash,
+            question or "",
+        ])
+        return True, "Saved to Google Sheet."
+    except Exception as e:
+        return False, f"Append failed: {e}"
+
+def current_flags_sheet_url():
+    try:
+        sid = st.secrets["GSPREAD_SHEET_ID"]
+        return f"https://docs.google.com/spreadsheets/d/{sid}/edit"
+    except Exception:
+        return None
 
 # ---------- Item preparation ----------
 def prepare_items(df: pd.DataFrame, domains: list[str], num: int):
@@ -162,11 +199,10 @@ def prepare_items(df: pd.DataFrame, domains: list[str], num: int):
     items = []
 
     for r in rows:
-        # Collect non-empty options
+        # Collect non-empty options and shuffle
         orig = [(lab, str(r.get(f"Option_{lab}", "")).strip()) for lab in "ABCDE"]
         orig = [(lab, txt) for lab, txt in orig if txt]
-
-        random.shuffle(orig)  # shuffle display order each time
+        random.shuffle(orig)
 
         # Map to display labels A.. in new order
         display_labels = list("ABCDE")[:len(orig)]
@@ -190,7 +226,6 @@ def start_quiz(df: pd.DataFrame):
     st.session_state.score = 0
     st.session_state.index = 0
     st.session_state.results = []
-    st.session_state.flagged_inaccurate = set()
     num = st.session_state.num_questions
     chosen_domains = st.session_state.domain_choice
     st.session_state.items = prepare_items(df, chosen_domains, num)
@@ -200,7 +235,6 @@ def restart_quiz():
     st.session_state.index = 0
     st.session_state.score = 0
     st.session_state.results = []
-    st.session_state.flagged_inaccurate = set()
 
 # ---------- Review renderer ----------
 def render_review(results):
@@ -210,7 +244,7 @@ def render_review(results):
         tick = "✅" if correct else "❌"
 
         st.markdown(f"### Q{i}. {rec['question']}")
-        st.caption(f"Domain: {rec['domain'] or '—'}  |  Source: {rec['source'] or '—'}")
+        st.caption(f"Domain: {rec['domain'] or '—'}")
 
         if rec["chosen_label"]:
             st.markdown(f"**Your answer {tick}:** {rec['chosen_label']}. {rec['chosen_text']}")
@@ -225,17 +259,20 @@ def render_review(results):
 
         if rec.get("explanation"):
             st.markdown(f"**Explanation:** {rec['explanation']}")
+        else:
+            st.markdown(
+                "<span style='color:#888;'>No explanation yet — to improve the bank, add one in data/questions.csv.</span>",
+                unsafe_allow_html=True
+            )
 
         cols = st.columns([1, 1, 1, 1])
         with cols[-1]:
             if st.button("Flag inaccurate 🚩", key=f"flag_end_{i}"):
-                ok, _ = append_flag_to_sheet(rec["domain"], rec["question"], rec["source"])
-                if not ok:
-                    # Fallback: keep also in memory (session)
-                    st.session_state.flagged_inaccurate.add(
-                        (rec["domain"], rec["question"], rec["source"])
-                    )
-                st.toast("Flag recorded. Thanks!", icon="✅")
+                ok, msg = append_flag_to_sheet(rec["domain"], rec["question"])
+                if ok:
+                    st.toast("Flag recorded. Thanks!", icon="✅")
+                else:
+                    st.error(msg)
 
         st.divider()
 
@@ -243,7 +280,7 @@ def render_review(results):
 def main():
     st.title("NPE Quiz 🧠")
 
-    # Sidebar (only the 3 controls you wanted)
+    # Sidebar (only the 3 controls)
     with st.sidebar:
         st.header("Settings")
         st.number_input("Number of questions", min_value=1, max_value=500, value=10, step=1, key="num_questions")
@@ -256,15 +293,33 @@ def main():
         )
 
         df_raw = load_questions(BUNDLED_CSV)
-        df, _ = clean_and_validate(df_raw)
+        df, issues, missing_report = clean_and_validate(df_raw)
 
         st.button("Start quiz", type="primary", on_click=start_quiz, args=(df,))
+
+        # Admin audit: find items missing Explanation or Domain
+        with st.expander("Admin: Data audit (missing Explanation/Domain)"):
+            n_missing = len(missing_report)
+            if n_missing == 0:
+                st.success("No missing Explanation/Domain ✅")
+            else:
+                st.warning(f"{n_missing} item(s) missing Explanation and/or Domain.")
+                st.download_button(
+                    "Download missing-items CSV",
+                    data=missing_report.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="missing_explanations_or_domains.csv",
+                    mime="text/csv"
+                )
+            # Optional: show where flags go
+            url = current_flags_sheet_url()
+            if url:
+                st.caption(f"Flags destination: [Google Sheet]({url})")
 
     # Get current items/index
     items = st.session_state.get("items", [])
     idx = st.session_state.get("index", 0)
 
-    # Landing page (special title/explanation)
+    # Landing page
     if not items:
         st.markdown(
             """
@@ -293,23 +348,40 @@ def main():
         st.success("Quiz complete!")
         st.metric("Score", f"{st.session_state.score}/{total}", f"{(st.session_state.score/total*100):.1f}%")
 
+        # Domain performance bar chart & recommendation
+        res_df = pd.DataFrame(st.session_state.results)
+        if not res_df.empty:
+            by_dom = (
+                res_df.groupby("domain", dropna=False)["is_correct"]
+                .agg(["count", "mean"])
+                .rename(columns={"count": "N", "mean": "Accuracy"})
+                .reset_index()
+            )
+            by_dom["Accuracy %"] = (by_dom["Accuracy"] * 100).round(1)
+
+            # Chart (only domains that are labeled)
+            ch_df = by_dom[by_dom["domain"].fillna("") != ""].set_index("domain")[["Accuracy %"]]
+            if not ch_df.empty:
+                st.subheader("Performance by Domain")
+                st.bar_chart(ch_df)  # simple Streamlit chart
+
+                # Recommend weakest focus area (prefer domains with N>=3; else any)
+                cand = by_dom[by_dom["N"] >= 3]
+                if cand.empty:
+                    cand = by_dom
+                if not cand.empty:
+                    weakest = cand.sort_values(["Accuracy", "N"], ascending=[True, False]).iloc[0]
+                    st.info(
+                        f"**Focus suggestion:** {weakest['domain'] or 'General'} "
+                        f"({weakest['Accuracy %']}% correct across {int(weakest['N'])} items). "
+                        "Consider reviewing this area before your next quiz."
+                    )
+
         # Review section (vertical list)
         if st.session_state.get("results"):
             render_review(st.session_state.results)
 
-        # Optional admin link to the Google Sheet
-        with st.expander("Admin: Open flag list (Google Sheet)"):
-            admin_pw = st.text_input("Admin password", type="password", placeholder="Enter to reveal link")
-            configured = ("GSPREAD_SHEET_ID" in st.secrets) and ("gcp_service_account" in st.secrets)
-            if not configured:
-                st.caption("Google Sheets logging isn't configured yet.")
-            elif admin_pw and admin_pw == st.secrets.get("ADMIN_PASS", ""):
-                sheet_id = st.secrets["GSPREAD_SHEET_ID"]
-                st.markdown(f"[Open flags sheet](https://docs.google.com/spreadsheets/d/{sheet_id}/edit)  ⇗")
-            else:
-                st.caption("Enter password to reveal the Google Sheet link.")
-
-        # Restart button
+        # Restart
         if st.button("Restart"):
             restart_quiz()
             st.rerun()
@@ -325,20 +397,18 @@ def main():
 
     st.subheader(f"Question {idx+1} of {total}")
     st.write(r.get("Question", ""))
-    st.caption(f"Domain: {r.get('Domain', '') or '—'}  |  Source: {r.get('Source', '') or '—'}")
+    st.caption(f"Domain: {r.get('Domain', '') or '—'}")
 
     # Radio with no default selection (index=None)
-    # Each option string encodes the display label (e.g., "A. text")
     display_choices = [f"{d['disp_lab']}. {d['text']}" for d in disp]
     choice = st.radio(
         "Choose one:",
         options=display_choices,
-        index=None,  # requires modern Streamlit; ensures no pre-selected option
+        index=None,
         label_visibility="collapsed",
         key=f"q_{idx}"
     )
 
-    # Submit only (no flag/skip on quiz screen per your spec)
     submitted = st.button("Submit answer", type="primary", key=f"submit_{idx}")
 
     if submitted:
@@ -361,7 +431,6 @@ def main():
         st.session_state.results.append({
             "ts": datetime.now().isoformat(timespec="seconds"),
             "domain": r.get("Domain", ""),
-            "source": r.get("Source", ""),
             "question": r.get("Question", ""),
             "chosen_label": chosen_lab,
             "chosen_text": chosen_text,
