@@ -14,7 +14,7 @@ REQUIRED_COLS = [
     "Option_A", "Option_B", "Option_C", "Option_D", "Option_E",
     "Correct_Answer",
     "Explanation",
-    "Domain"
+    "Domain",
 ]
 
 DOMAIN_OPTIONS = ["All", "Ethics", "Assessment", "Intervention", "Communication"]
@@ -71,7 +71,7 @@ def prepare_items(df: pd.DataFrame, num: int, seed: int | None = None):
         for new_lab, (orig_lab, txt) in zip(display_labels, orig):
             disp.append({"disp_lab": new_lab, "orig_lab": orig_lab, "text": txt})
 
-        # Figure out which visible label is correct
+        # Which visible label is correct?
         orig_correct = (r.get("Correct_Answer", "") or "").strip().upper()
         correct_disp = next(
             (d["disp_lab"] for d in disp if d["orig_lab"] == orig_correct),
@@ -88,19 +88,17 @@ def prepare_items(df: pd.DataFrame, num: int, seed: int | None = None):
     return items
 
 def reset_quiz_state():
-    st.session_state.items = []
-    st.session_state.index = 0
-    st.session_state.score = 0
-    st.session_state.results = []
+    st.session_state["q_items"] = []
+    st.session_state["index"] = 0
+    st.session_state["score"] = 0
+    st.session_state["results"] = []
 
 def start_quiz(df: pd.DataFrame, domain_choice: str, num_questions: int):
-    # Prepare filtered items and store in session
-    st.session_state.score = 0
-    st.session_state.index = 0
-    st.session_state.results = []
-
+    st.session_state["score"] = 0
+    st.session_state["index"] = 0
+    st.session_state["results"] = []
     df_filt = filter_by_domain(df, domain_choice)
-    st.session_state.items = prepare_items(df_filt, num_questions, seed=None)
+    st.session_state["q_items"] = prepare_items(df_filt, num_questions, seed=None)
 
 # ----------------------------
 # Google Sheets (optional)
@@ -122,7 +120,6 @@ def submit_flag_to_sheets(question_text: str, reason: str):
         client = gspread.authorize(creds)
         sh = client.open_by_key(sheet_id)
 
-        # Create / open a worksheet called "Flags"
         try:
             ws = sh.worksheet("Flags")
         except gspread.WorksheetNotFound:
@@ -144,7 +141,6 @@ def submit_flag_to_sheets(question_text: str, reason: str):
 def title_page():
     st.title("🧠 NPE Quiz — Study Companion")
     st.subheader("Welcome! 👋")
-
     st.markdown(
         """
 This little app started as **my personal study tool** for the National Psychology Exam — and I thought it’d be fun to **share it with other candidates** who might find it useful.
@@ -173,17 +169,16 @@ def quiz_screen(item, idx, total):
     st.write(r.get("Question", ""))
     st.caption(f"Domain: {r.get('Domain','—')}")
 
-    # Create radio with NO default selection
+    # Radio with NO default selection
     display_choices = [f"{d['disp_lab']}. {d['text']}" for d in disp]
     choice = st.radio(
         label="Choose one:",
         options=display_choices,
-        index=None,  # <- no preselection
+        index=None,
         key=f"choice_{idx}",
         label_visibility="collapsed",
     )
 
-    # Submit
     submitted = st.button("Submit answer", key=f"submit_{idx}")
 
     if submitted:
@@ -196,20 +191,18 @@ def quiz_screen(item, idx, total):
 
         if is_correct:
             st.success("Correct!")
-            st.session_state.score += 1
+            st.session_state["score"] += 1
         else:
             st.error(f"Incorrect. Correct is {correct_disp}.")
 
-        # Explanation
         expl = r.get("Explanation", "")
         if expl:
             st.info(f"**Explanation:** {expl}")
 
-        # Store result (include explanation so we can show it in the final review)
         correct_text = next((d["text"] for d in disp if d["disp_lab"] == correct_disp), "")
         chosen_text = next((d["text"] for d in disp if d["disp_lab"] == chosen_lab), "")
 
-        st.session_state.results.append(
+        st.session_state["results"].append(
             {
                 "ts": datetime.now().isoformat(timespec="seconds"),
                 "domain": r.get("Domain", ""),
@@ -223,20 +216,18 @@ def quiz_screen(item, idx, total):
             }
         )
 
-        # Advance
-        st.session_state.index += 1
+        st.session_state["index"] += 1
         st.rerun()
 
 def results_screen():
     st.success("Quiz complete!")
-    total = len(st.session_state.items)
-    score = st.session_state.score
+    total = len(st.session_state.get("q_items", []))
+    score = st.session_state.get("score", 0)
 
-    st.metric("Score", f"{score}/{total}", f"{(score/total*100):.1f}%")
+    st.metric("Score", f"{score}/{total}", f"{(score/total*100 if total else 0):.1f}%")
 
-    res_df = pd.DataFrame(st.session_state.results)
+    res_df = pd.DataFrame(st.session_state.get("results", []))
 
-    # Nicely formatted scrollable list of Q&A with explanations
     st.markdown("### Review your answers")
     if res_df.empty:
         st.info("No answers recorded.")
@@ -246,7 +237,6 @@ def results_screen():
             st.markdown(f"**Q{i+1}. {row['question']}**")
             st.caption(f"Domain: {row['domain'] or '—'}")
 
-            # Answers block
             chosen = f"{row['chosen_label']}. {row['chosen_text']}".strip() if row['chosen_label'] else "—"
             correct = f"{row['correct_label']}. {row['correct_text']}".strip()
 
@@ -256,13 +246,12 @@ def results_screen():
                 st.markdown(f"**❌ Your answer:** {chosen}")
                 st.markdown(f"**✅ Correct answer:** {correct}")
 
-            # Explanation
             if str(row.get("explanation", "")).strip():
                 st.markdown(f"**Explanation:** {row['explanation']}")
 
         st.markdown("")
 
-        # Domain performance bar chart (no matplotlib; use Streamlit's built-in)
+        # Domain performance bar chart (built-in)
         st.markdown("### Performance by domain")
         acc = (
             res_df.groupby("domain")["is_correct"]
@@ -272,10 +261,7 @@ def results_screen():
             .round(1)
         )
         if not acc.empty:
-            chart_df = acc.rename("Accuracy %").to_frame()
-            st.bar_chart(chart_df, use_container_width=True)
-
-            # Simple recommendation (focus area)
+            st.bar_chart(acc.rename("Accuracy %").to_frame(), use_container_width=True)
             worst_domain = acc.idxmin()
             st.info(
                 f"**Suggestion:** Your lowest accuracy was in **{worst_domain}**. "
@@ -285,9 +271,12 @@ def results_screen():
     # Flagging form at the very end
     st.markdown("### Flag an inaccurate question")
     with st.form("flag_form"):
-        # Let the user pick a question they want to flag
-        questions_list = [r["question"] for r in st.session_state.results]
-        q_pick = st.selectbox("Which question needs review?", options=questions_list if questions_list else ["—"], index=0)
+        questions_list = [r["question"] for r in st.session_state.get("results", [])]
+        q_pick = st.selectbox(
+            "Which question needs review?",
+            options=questions_list if questions_list else ["—"],
+            index=0,
+        )
         reason = st.text_area("What’s wrong? Be as specific as possible.")
         submitted = st.form_submit_button("Submit flag")
         if submitted:
@@ -300,7 +289,6 @@ def results_screen():
             else:
                 st.warning("Please select a question and enter a reason.")
 
-    # Action buttons
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Restart"):
@@ -315,17 +303,15 @@ def results_screen():
 def main():
     st.set_page_config(page_title="NPE Quiz", page_icon="🧠", layout="centered")
 
-    # Load data once
+    # Load questions
     df_all = load_questions(BUNDLED_CSV)
 
-    # Sidebar — the only controls
+    # Sidebar controls
     with st.sidebar:
         st.header("Settings")
 
-        # Domain selector (single)
         domain_choice = st.selectbox("Domain", DOMAIN_OPTIONS, index=0)
 
-        # Max questions based on current domain
         avail = len(filter_by_domain(df_all, domain_choice))
         if avail == 0:
             st.caption("No questions available for this domain.")
@@ -339,13 +325,12 @@ def main():
             step=1,
         )
 
-        # Start quiz button
         if st.button("Start quiz"):
             start_quiz(df_all, domain_choice, int(num_questions))
             st.rerun()
 
-    # Body – either title page, quiz, or results
-    items = st.session_state.get("items", [])
+    # Body – title page, quiz, or results
+    items = st.session_state.get("q_items", [])
     idx = st.session_state.get("index", 0)
 
     if not items:
@@ -356,11 +341,9 @@ def main():
         results_screen()
         return
 
-    # Quiz page
     quiz_screen(items[idx], idx, len(items))
 
 if __name__ == "__main__":
-    # Initialize session defaults if needed
-    if "items" not in st.session_state:
+    if "q_items" not in st.session_state:
         reset_quiz_state()
     main()
