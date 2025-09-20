@@ -1,7 +1,6 @@
 # app.py
 import streamlit as st
 import pandas as pd
-import random
 from datetime import datetime
 
 # ----------------------------
@@ -41,51 +40,47 @@ def load_questions(path: str) -> pd.DataFrame:
             )
     return df
 
+
 def filter_by_domain(df: pd.DataFrame, domain_choice: str) -> pd.DataFrame:
     if domain_choice and domain_choice != "All":
         return df[df["Domain"].str.lower() == domain_choice.lower()].copy()
     return df.copy()
 
-def prepare_items(df: pd.DataFrame, num: int, seed: int | None = None):
-    """Return a list of items with shuffled choices and mapped correct labels."""
+
+def prepare_items(df: pd.DataFrame, num: int):
+    """
+    Build items WITHOUT shuffling. Options are displayed in original A–E order,
+    and the correct answer letter remains exactly as in the CSV.
+    """
     if df.empty:
         return []
     if num > len(df):
         num = len(df)
 
-    rng = random.Random(seed)
+    # sample rows (without reordering options)
     rows = df.sample(n=num, random_state=None).to_dict(orient="records")
 
     items = []
     for r in rows:
-        # Build original list of (label, text) and keep non-empty
+        # Keep original A..E order; drop blanks
         orig = [(lab, r.get(f"Option_{lab}", "").strip()) for lab in list("ABCDE")]
         orig = [(lab, txt) for lab, txt in orig if txt]
 
-        # Shuffle the visible order
-        rng.shuffle(orig)
+        # For display we keep the original label as the visible label
+        disp = [{"disp_lab": lab, "orig_lab": lab, "text": txt} for lab, txt in orig]
 
-        # Remap to visible labels A.. in the new order
-        display_labels = list("ABCDE")[:len(orig)]
-        disp = []
-        for new_lab, (orig_lab, txt) in zip(display_labels, orig):
-            disp.append({"disp_lab": new_lab, "orig_lab": orig_lab, "text": txt})
-
-        # Which visible label is correct?
-        orig_correct = (r.get("Correct_Answer", "") or "").strip().upper()
-        correct_disp = next(
-            (d["disp_lab"] for d in disp if d["orig_lab"] == orig_correct),
-            None,
-        )
+        # Correct letter is the original CSV value
+        correct_letter = (r.get("Correct_Answer", "") or "").strip().upper()
 
         items.append(
             {
                 "row": r,
                 "disp": disp,
-                "correct_disp": correct_disp,
+                "correct_disp": correct_letter,  # same as original
             }
         )
     return items
+
 
 def reset_quiz_state():
     st.session_state["q_items"] = []
@@ -93,37 +88,24 @@ def reset_quiz_state():
     st.session_state["score"] = 0
     st.session_state["results"] = []
 
+
 def start_quiz(df: pd.DataFrame, domain_choice: str, num_questions: int):
     st.session_state["score"] = 0
     st.session_state["index"] = 0
     st.session_state["results"] = []
     df_filt = filter_by_domain(df, domain_choice)
-    st.session_state["q_items"] = prepare_items(df_filt, num_questions, seed=None)
+    st.session_state["q_items"] = prepare_items(df_filt, num_questions)
+
 
 # ----------------------------
 # Google Sheets (optional)
 # ----------------------------
-def _get_or_create_flags_worksheet(client, sheet_id: str):
-    """Return a worksheet object for 'Flags', case-insensitive; create if missing."""
-    sh = client.open_by_key(sheet_id)
-    try:
-        # Try exact match first
-        return sh.worksheet("Flags")
-    except Exception:
-        # Fall back: search case-insensitively
-        try:
-            for ws in sh.worksheets():
-                if ws.title.lower() == "flags":
-                    return ws
-        except Exception:
-            pass
-        # Create if not found
-        ws = sh.add_worksheet(title="Flags", rows=200, cols=5)
-        ws.append_row(["timestamp", "question", "reason"])
-        return ws
-
 def submit_flag_to_sheets(question_text: str, reason: str):
-    """Append a flag row to Google Sheets if secrets are configured."""
+    """
+    Append a flag row to Google Sheets if secrets are configured.
+    Tries to find a worksheet named 'Flags' or 'flags' (case-insensitive).
+    Creates 'Flags' if none exist.
+    """
     try:
         sheet_id = st.secrets.get("GSPREAD_SHEET_ID", None)
         svc = st.secrets.get("gcp_service_account", None)
@@ -137,8 +119,24 @@ def submit_flag_to_sheets(question_text: str, reason: str):
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = Credentials.from_service_account_info(svc, scopes=scopes)
         client = gspread.authorize(creds)
+        sh = client.open_by_key(sheet_id)
 
-        ws = _get_or_create_flags_worksheet(client, sheet_id)
+        # Try to find any sheet named case-insensitively like "flags"
+        ws = None
+        for w in sh.worksheets():
+            if w.title.lower() == "flags":
+                ws = w
+                break
+
+        if ws is None:
+            # Create once if not present
+            try:
+                ws = sh.add_worksheet(title="Flags", rows=200, cols=5)
+                ws.append_row(["timestamp", "question", "reason"])
+            except Exception:
+                # If it exists but with odd casing and add_worksheet failed, search again strictly
+                ws = sh.worksheet("Flags")
+
         ws.append_row(
             [datetime.now().isoformat(timespec="seconds"), question_text, reason],
             value_input_option="USER_ENTERED",
@@ -148,43 +146,60 @@ def submit_flag_to_sheets(question_text: str, reason: str):
         st.error(f"Unable to log flag to Google Sheets: {e}")
         return False
 
+
 # ----------------------------
 # UI pieces
 # ----------------------------
-def title_page(total_count: int):
+def title_page(df_all: pd.DataFrame):
+    total_count = len(df_all)
+    by_domain = (
+        df_all.assign(Domain=df_all["Domain"].fillna("").replace("nan", ""))
+        .groupby(df_all["Domain"].str.title().fillna("Unknown"))
+        .size()
+        .sort_values(ascending=False)
+    )
+
     st.title("🧠 NPE Quiz — Study Companion")
     st.subheader("Welcome! 👋")
-    # Big question-bank counter
-    st.metric(label="Question bank", value=f"{total_count} questions")
+
+    st.markdown(
+        f"""
+This app started as **my personal study tool** for the National Psychology Exam — and I thought it’d be fun to **share it with other candidates** who might find it useful.
+
+**What’s inside right now**
+- **{total_count}** questions in the bank (and growing).
+"""
+    )
+    with st.expander("See question counts by domain"):
+        st.write(by_domain.to_frame(name="Questions"))
 
     st.markdown(
         """
-This little app started as **my personal study tool** for the National Psychology Exam — and I thought it’d be fun to **share it with other candidates** who might find it useful.
-
 **How it works**
-- Questions are drawn from a local bank.
-- Choose a **Domain** and **Number of questions** in the sidebar.
-- At the end, you’ll see a **scrollable list of every question**, your answer, the **correct answer**, and an explanation.
-- You’ll also get a **bar chart** showing how you went by domain to help guide future revision.
+- Pick a **Domain** and **Number of questions** in the sidebar, then hit **Start quiz**.
+- Questions appear with options in their **original A–E order** (no shuffling).
+- At the end you’ll get a **scrollable list of every question**, your answer, the **correct answer**, and an explanation.
+- You’ll also see a **bar chart** breaking down accuracy by domain so you can target your next study session.
 
 **Help me improve it**
-- If you spot anything off, you can **flag an inaccurate question** at the bottom of the results page (there’s a text box to explain what you noticed).
-- Have ideas or fixes? I’d love to hear them. Send me a message with your suggestions!
+- Found something off? On the results page you can **flag an inaccurate question** and add a short note.
+- Got an idea, bug, or fix? I’d love to hear it — please message me!
 
-When you’re ready, use the **sidebar** ➜ pick your settings and click **Start quiz**.
+When you’re ready, use the **sidebar** to start your quiz.
         """
     )
+
 
 def quiz_screen(item, idx, total):
     r = item["row"]
     disp = item["disp"]
-    correct_disp = item["correct_disp"]
+    correct_disp = item["correct_disp"]  # original correct letter
 
     st.subheader(f"Question {idx+1} of {total}")
     st.write(r.get("Question", ""))
     st.caption(f"Domain: {r.get('Domain','—')}")
 
-    # Radio with NO default selection
+    # Keep original letters for display (no default selection)
     display_choices = [f"{d['disp_lab']}. {d['text']}" for d in disp]
     choice = st.radio(
         label="Choose one:",
@@ -214,8 +229,15 @@ def quiz_screen(item, idx, total):
         if expl:
             st.info(f"**Explanation:** {expl}")
 
-        correct_text = next((d["text"] for d in disp if d["disp_lab"] == correct_disp), "")
-        chosen_text = next((d["text"] for d in disp if d["disp_lab"] == chosen_lab), "")
+        # Pull the chosen/correct texts
+        def text_for(label):
+            for d in disp:
+                if d["disp_lab"] == label:
+                    return d["text"]
+            return ""
+
+        correct_text = text_for(correct_disp)
+        chosen_text = text_for(chosen_lab)
 
         st.session_state["results"].append(
             {
@@ -233,6 +255,7 @@ def quiz_screen(item, idx, total):
 
         st.session_state["index"] += 1
         st.rerun()
+
 
 def results_screen():
     st.success("Quiz complete!")
@@ -266,7 +289,7 @@ def results_screen():
 
         st.markdown("")
 
-        # Domain performance bar chart (at the end)
+        # Domain performance bar chart at the end
         st.markdown("### Performance by domain")
         acc = (
             res_df.groupby("domain")["is_correct"]
@@ -280,7 +303,7 @@ def results_screen():
             worst_domain = acc.idxmin()
             st.info(
                 f"**Suggestion:** Your lowest accuracy was in **{worst_domain}**. "
-                "Consider focusing revision there in your next practice."
+                "Consider focusing revision there next time."
             )
 
     # Flagging form at the very end
@@ -312,6 +335,7 @@ def results_screen():
     with col2:
         st.caption("Thanks for testing the app! 🚀")
 
+
 # ----------------------------
 # Main app
 # ----------------------------
@@ -320,7 +344,6 @@ def main():
 
     # Load questions
     df_all = load_questions(BUNDLED_CSV)
-    total_count = len(df_all)
 
     # Sidebar controls
     with st.sidebar:
@@ -350,7 +373,7 @@ def main():
     idx = st.session_state.get("index", 0)
 
     if not items:
-        title_page(total_count)
+        title_page(df_all)
         return
 
     if idx >= len(items):
@@ -358,6 +381,7 @@ def main():
         return
 
     quiz_screen(items[idx], idx, len(items))
+
 
 if __name__ == "__main__":
     if "q_items" not in st.session_state:
