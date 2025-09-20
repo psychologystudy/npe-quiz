@@ -103,6 +103,25 @@ def start_quiz(df: pd.DataFrame, domain_choice: str, num_questions: int):
 # ----------------------------
 # Google Sheets (optional)
 # ----------------------------
+def _get_or_create_flags_worksheet(client, sheet_id: str):
+    """Return a worksheet object for 'Flags', case-insensitive; create if missing."""
+    sh = client.open_by_key(sheet_id)
+    try:
+        # Try exact match first
+        return sh.worksheet("Flags")
+    except Exception:
+        # Fall back: search case-insensitively
+        try:
+            for ws in sh.worksheets():
+                if ws.title.lower() == "flags":
+                    return ws
+        except Exception:
+            pass
+        # Create if not found
+        ws = sh.add_worksheet(title="Flags", rows=200, cols=5)
+        ws.append_row(["timestamp", "question", "reason"])
+        return ws
+
 def submit_flag_to_sheets(question_text: str, reason: str):
     """Append a flag row to Google Sheets if secrets are configured."""
     try:
@@ -118,14 +137,8 @@ def submit_flag_to_sheets(question_text: str, reason: str):
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = Credentials.from_service_account_info(svc, scopes=scopes)
         client = gspread.authorize(creds)
-        sh = client.open_by_key(sheet_id)
 
-        try:
-            ws = sh.worksheet("Flags")
-        except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(title="Flags", rows=100, cols=5)
-            ws.append_row(["timestamp", "question", "reason"])
-
+        ws = _get_or_create_flags_worksheet(client, sheet_id)
         ws.append_row(
             [datetime.now().isoformat(timespec="seconds"), question_text, reason],
             value_input_option="USER_ENTERED",
@@ -138,9 +151,12 @@ def submit_flag_to_sheets(question_text: str, reason: str):
 # ----------------------------
 # UI pieces
 # ----------------------------
-def title_page():
+def title_page(total_count: int):
     st.title("🧠 NPE Quiz — Study Companion")
     st.subheader("Welcome! 👋")
+    # Big question-bank counter
+    st.metric(label="Question bank", value=f"{total_count} questions")
+
     st.markdown(
         """
 This little app started as **my personal study tool** for the National Psychology Exam — and I thought it’d be fun to **share it with other candidates** who might find it useful.
@@ -250,7 +266,7 @@ def results_screen():
 
         st.markdown("")
 
-        # Domain performance bar chart (built-in)
+        # Domain performance bar chart (at the end)
         st.markdown("### Performance by domain")
         acc = (
             res_df.groupby("domain")["is_correct"]
@@ -304,6 +320,7 @@ def main():
 
     # Load questions
     df_all = load_questions(BUNDLED_CSV)
+    total_count = len(df_all)
 
     # Sidebar controls
     with st.sidebar:
@@ -333,7 +350,7 @@ def main():
     idx = st.session_state.get("index", 0)
 
     if not items:
-        title_page()
+        title_page(total_count)
         return
 
     if idx >= len(items):
